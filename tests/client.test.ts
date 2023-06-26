@@ -1,6 +1,5 @@
 import { DirectSecp256k1HdWallet } from "@cosmjs/proto-signing";
-import { CosmosClient } from "../src";
-import { CosmosClientOptions } from "../src/types";
+import { CosmosClient, CosmosClientOptions } from "../src";
 import { chains } from "chain-registry";
 
 describe("CosmosClient", () => {
@@ -10,7 +9,7 @@ describe("CosmosClient", () => {
     const client = await CosmosClient.new({
       mnemonic,
       chainId: chain.chain_id,
-    } as CosmosClientOptions);
+    } as Partial<CosmosClientOptions>);
     expect(client.walletPrefix).toBe(chain.bech32_prefix);
     expect(client.gasDenom).toBe(chain.fees!.fee_tokens[0].denom);
   });
@@ -21,7 +20,7 @@ describe("CosmosClient", () => {
     const client = await CosmosClient.new({
       mnemonic,
       chainId: chain.chain_id,
-    } as CosmosClientOptions);
+    } as Partial<CosmosClientOptions>);
     expect(client.walletPrefix).toBe(chain.bech32_prefix);
     expect(client.gasDenom).toBe(chain.fees!.fee_tokens[0].denom);
   });
