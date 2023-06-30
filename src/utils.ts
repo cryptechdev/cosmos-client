@@ -1,6 +1,5 @@
 import { SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
 import { MsgBroadcasterWithPk } from "@injectivelabs/sdk-ts";
-import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 
 export const isCosmjsClient = (
   client: SigningCosmWasmClient | MsgBroadcasterWithPk,

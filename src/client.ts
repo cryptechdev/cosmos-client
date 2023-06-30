@@ -1,18 +1,40 @@
-import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
-import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
-import { Network, getNetworkEndpoints } from "@injectivelabs/networks";
-import { chains } from "chain-registry";
+import { CosmWasmClient, MsgExecuteContractEncodeObject, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
+import { stringToPath } from "@cosmjs/crypto";
 import { DirectSecp256k1HdWallet, EncodeObject, OfflineDirectSigner } from "@cosmjs/proto-signing";
+import { DeliverTxResponse, Event, GasPrice, SignerData, StdFee, isDeliverTxFailure } from "@cosmjs/stargate";
+import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
+import { Network, NetworkEndpoints, getNetworkEndpoints } from "@injectivelabs/networks";
 import {
+  BaseAccount,
+  ChainRestAuthApi,
+  ChainRestTendermintApi,
   InjectiveDirectEthSecp256k1Wallet,
   MsgExecuteContract as InjectiveMsgExecuteContract,
   MsgBroadcasterWithPk,
+  Msgs,
   PrivateKey,
+  TxGrpcApi,
+  createTransaction,
+  getGasPriceBasedOnMessage,
 } from "@injectivelabs/sdk-ts";
-import { GasPrice, StdFee, isDeliverTxFailure } from "@cosmjs/stargate";
-import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
-import { CosmWasmClient, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
+import { BigNumberInBase, DEFAULT_BLOCK_TIMEOUT_HEIGHT, getStdFee } from "@injectivelabs/utils";
+import { chains } from "chain-registry";
+import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
+import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
 import { isCosmjsClient, isInjectiveClient } from "./utils";
+
+export interface MsgBroadcasterTxOptions {
+  msgs: Msgs | Msgs[];
+  injectiveAddress: string;
+  ethereumAddress?: string;
+  memo?: string;
+  gas?: {
+    gasPrice?: string;
+    gas?: number /** gas limit */;
+    feePayer?: string;
+    granter?: string;
+  };
+}
 
 export type CosmosClientOptions = {
   chainId: string;
@@ -24,6 +46,7 @@ export type CosmosClientOptions = {
   gasPrice: number | string;
   gasAdjustment: number | string;
   walletType: "cosmos" | "injective";
+  endpoints: NetworkEndpoints;
   granter?: string;
 };
 
@@ -38,12 +61,14 @@ export class CosmosClient {
     this.gasPrice = Number(options.gasPrice);
     this.gasAdjustment = Number(options.gasAdjustment);
     this.walletType = options.walletType;
+    this.endpoints = options.endpoints;
     this.granter = options.granter;
   }
   chainId: string;
   mnemonic: string;
   walletPrefix: string;
   rpcEndpoint: string;
+  endpoints: NetworkEndpoints;
   coinType: number;
   gasDenom: string;
   gasPrice: number;
@@ -53,15 +78,6 @@ export class CosmosClient {
   querier?: any;
   cosmosAddress?: string;
   granter?: string;
-  private generateHdPath(coinType: string): HdPath {
-    return [
-      Slip10RawIndex.hardened(44),
-      Slip10RawIndex.hardened(Number(coinType)),
-      Slip10RawIndex.hardened(0),
-      Slip10RawIndex.normal(0),
-      Slip10RawIndex.normal(0),
-    ];
-  }
   private getPrivateKey(): PrivateKey {
     return PrivateKey.fromMnemonic(this.mnemonic, `m/44'/${this.coinType}'/0'/0/0`);
   }
@@ -74,11 +90,12 @@ export class CosmosClient {
     } else {
       return await DirectSecp256k1HdWallet.fromMnemonic(this.mnemonic, {
         prefix: this.walletPrefix,
-        hdPaths: [this.generateHdPath(`${this.coinType}`)],
+        hdPaths: [stringToPath(`m/44'/${this.coinType}'/0'/0/0`)],
       });
     }
   }
-  public static async new(options: Partial<CosmosClientOptions>): Promise<CosmosClient> {
+
+  private static sanitizeOptions(options: Partial<CosmosClientOptions>): CosmosClientOptions {
     if (!options.chainId || options.chainId.length === 0) {
       throw new Error(`Missing chainId`);
     }
@@ -166,6 +183,10 @@ export class CosmosClient {
     } else {
       options.gasAdjustment = 1.1;
     }
+    return options as CosmosClientOptions;
+  }
+  public static async new(opts: Partial<CosmosClientOptions>): Promise<CosmosClient> {
+    const options = CosmosClient.sanitizeOptions(opts);
 
     const client = new CosmosClient(options as CosmosClientOptions);
     const signer = await client.getSigner();
@@ -174,13 +195,13 @@ export class CosmosClient {
     client.querier = await CosmWasmClient.create(tmClient);
     if (client.walletType === "injective") {
       const network: Network = Network[client.rpcEndpoint.indexOf("testnet") > -1 ? "TestnetK8s" : "MainnetK8s"];
-      const endpoints = getNetworkEndpoints(network);
+      client.endpoints = getNetworkEndpoints(network);
       const privateKey = client.getPrivateKey();
       client.cosmosAddress = privateKey.toAddress().toBech32(client.walletPrefix);
       client.signingClient = new MsgBroadcasterWithPk({
         privateKey,
         network,
-        endpoints,
+        endpoints: client.endpoints,
         simulateTx: true,
       });
     } else {
@@ -200,10 +221,101 @@ export class CosmosClient {
     return await this.querier.queryContractSmart(contractAddr, payload);
   }
 
+  async sign(
+    signerAddress: string,
+    messages: readonly MsgExecuteContractEncodeObject[],
+    fee: StdFee,
+    memo: string,
+    explicitSignerData?: SignerData,
+  ): Promise<TxRaw> {
+    if (isCosmjsClient(this.signingClient!)) {
+      return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
+    } else if (isInjectiveClient(this.signingClient!)) {
+      const injMessages = messages.map((msg: MsgExecuteContractEncodeObject) => {
+        return InjectiveMsgExecuteContract.fromJSON({
+          sender: this.cosmosAddress!,
+          contractAddress: msg.value.contract!,
+          msg:
+            msg.value.msg instanceof Uint8Array
+              ? JSON.parse(Buffer.from(msg.value.msg).toString("utf-8"))
+              : msg.value.msg,
+          funds: msg.value.funds,
+        });
+      });
+      const tx = {
+        msgs: injMessages,
+        injectiveAddress: this.cosmosAddress!,
+        memo,
+        gas: fee as any,
+      } as MsgBroadcasterTxOptions;
+      const publicKey = this.signingClient.privateKey.toPublicKey();
+      const account = await this.getAccount();
+      if (!account) {
+        throw new Error("Account not found");
+      }
+      const chainRestTendermintApi = new ChainRestTendermintApi(this.endpoints.rest);
+      const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
+      const latestHeight = latestBlock.header.height;
+      const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
+      const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
+      const { signBytes, txRaw } = createTransaction({
+        memo: tx.memo || "",
+        message: injMessages,
+        fee: getStdFee({ ...tx.gas, gas }),
+        timeoutHeight: timeoutHeight.toNumber(),
+        pubKey: publicKey.toBase64(),
+        sequence: account.sequence,
+        accountNumber: account.accountNumber,
+        chainId: this.chainId,
+      });
+      const signature = await this.signingClient.privateKey.sign(Buffer.from(signBytes));
+
+      txRaw.signatures = [signature];
+
+      return txRaw;
+    } else {
+      throw new Error("Client not supported for signing");
+    }
+  }
+
+  async broadcast(txRaw: TxRaw): Promise<DeliverTxResponse> {
+    if (isCosmjsClient(this.signingClient)) {
+      const bytes = TxRaw.encode(txRaw).finish();
+      return await this.signingClient.broadcastTx(bytes);
+    } else if (isInjectiveClient(this.signingClient)) {
+      const txResponse = await new TxGrpcApi(this.endpoints.grpc).broadcast(txRaw);
+
+      if (txResponse.code !== 0) {
+        throw new Error(`Transaction failed to be broadcasted - ${txResponse.rawLog}`);
+      }
+      return {
+        ...txResponse,
+        transactionHash: txResponse.txHash,
+        txIndex: 0,
+        events: (txResponse.events as readonly Event[]) || [],
+        data: [],
+      };
+    }
+    throw new Error("Client not supported for broadcasting");
+  }
+
+  async getAccount(): Promise<{ accountNumber: number; sequence: number } | null> {
+    if (isCosmjsClient(this.signingClient)) {
+      return await this.signingClient.getAccount(this.cosmosAddress!);
+    } else if (isInjectiveClient(this.signingClient)) {
+      const chainRestAuthApi = new ChainRestAuthApi(this.endpoints.rest);
+      const accountDetailsResponse = await chainRestAuthApi.fetchAccount(this.cosmosAddress!);
+      const baseAccount = BaseAccount.fromRestApi(accountDetailsResponse);
+      const accountDetails = baseAccount.toAccountDetails();
+      return accountDetails;
+    }
+    return null;
+  }
+
   async tx(contract: string, payload: any): Promise<string> {
     let response: any;
     if (isCosmjsClient(this.signingClient!)) {
-      const msgs: EncodeObject[] = [
+      const msgs: MsgExecuteContractEncodeObject[] = [
         {
           typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
           value: MsgExecuteContract.fromPartial({
@@ -213,7 +325,7 @@ export class CosmosClient {
           }),
         },
       ];
-      const fees = await this.simulateFees(this.signingClient, this.cosmosAddress!, msgs);
+      const fees = await this.simulateFees(msgs);
       response = await this.signingClient.signAndBroadcast(this.cosmosAddress!, msgs, fees);
     } else if (isInjectiveClient(this.signingClient!)) {
       const msgs: InjectiveMsgExecuteContract[] = [
@@ -246,18 +358,48 @@ export class CosmosClient {
 
     return response.transactionHash;
   }
-  private async simulateFees(client: SigningCosmWasmClient, sender: string, msgs: EncodeObject[]): Promise<StdFee> {
-    const gas = await client.simulate(sender, msgs, undefined);
+  async simulateFees(msgs: MsgExecuteContractEncodeObject[]): Promise<StdFee> {
+    if (isCosmjsClient(this.signingClient!)) {
+      const gas = await this.signingClient.simulate(this.cosmosAddress!, msgs as EncodeObject[], undefined);
+      return {
+        amount: [
+          {
+            denom: this.gasDenom,
+            amount: Math.ceil(gas * this.gasPrice! * this.gasAdjustment!).toString(),
+          },
+        ],
+        gas: Math.ceil(gas * this.gasAdjustment!).toString(),
+        granter: this.granter,
+      } as StdFee;
+    } else if (isInjectiveClient(this.signingClient!)) {
+      const injMessages = msgs.map((msg: MsgExecuteContractEncodeObject) => {
+        return InjectiveMsgExecuteContract.fromJSON({
+          sender: this.cosmosAddress!,
+          contractAddress: msg.value.contract!,
+          msg:
+            msg.value.msg instanceof Uint8Array
+              ? JSON.parse(Buffer.from(msg.value.msg).toString("utf-8"))
+              : msg.value.msg,
+          funds: msg.value.funds,
+        });
+      });
 
-    return {
-      amount: [
-        {
-          denom: this.gasDenom,
-          amount: Math.ceil(gas * this.gasPrice! * this.gasAdjustment!).toString(),
-        },
-      ],
-      gas: Math.ceil(gas * this.gasAdjustment!).toString(),
-      granter: this.granter,
-    } as StdFee;
+      const fees = await this.signingClient.simulate({
+        msgs: injMessages,
+        injectiveAddress: this.cosmosAddress!,
+      });
+      return {
+        amount: [
+          {
+            denom: this.gasDenom,
+            amount: Math.ceil(fees.gasInfo.gasUsed * this.gasPrice! * this.gasAdjustment!).toString(),
+          },
+        ],
+        gas: Math.ceil(fees.gasInfo.gasUsed * this.gasAdjustment!).toString(),
+        granter: this.granter,
+      } as StdFee;
+    } else {
+      throw new Error("Invalid signing client to simulate fees");
+    }
   }
 }
