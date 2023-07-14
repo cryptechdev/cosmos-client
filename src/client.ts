@@ -1,5 +1,5 @@
 import { CosmWasmClient, MsgExecuteContractEncodeObject, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
-import { stringToPath } from "@cosmjs/crypto";
+import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { DirectSecp256k1HdWallet, EncodeObject, OfflineDirectSigner } from "@cosmjs/proto-signing";
 import { DeliverTxResponse, Event, GasPrice, SignerData, StdFee, isDeliverTxFailure } from "@cosmjs/stargate";
 import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
@@ -10,6 +10,7 @@ import {
   ChainRestTendermintApi,
   InjectiveDirectEthSecp256k1Wallet,
   MsgExecuteContract as InjectiveMsgExecuteContract,
+  MsgSend as InjectiveMsgSend,
   MsgBroadcasterWithPk,
   Msgs,
   PrivateKey,
@@ -22,6 +23,7 @@ import { chains } from "chain-registry";
 import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
 import { isCosmjsClient, isInjectiveClient } from "./utils";
+import Decimal from "decimal.js";
 
 export interface MsgBroadcasterTxOptions {
   msgs: Msgs | Msgs[];
@@ -75,11 +77,20 @@ export class CosmosClient {
   gasAdjustment: number;
   walletType: "cosmos" | "injective";
   signingClient?: any;
-  querier?: any;
+  querier?: CosmWasmClient;
   cosmosAddress?: string;
   granter?: string;
   private getPrivateKey(): PrivateKey {
     return PrivateKey.fromMnemonic(this.mnemonic, `m/44'/${this.coinType}'/0'/0/0`);
+  }
+  private generateHdPath(coinType: string): HdPath {
+    return [
+      Slip10RawIndex.hardened(44),
+      Slip10RawIndex.hardened(Number(coinType)),
+      Slip10RawIndex.hardened(0),
+      Slip10RawIndex.normal(0),
+      Slip10RawIndex.normal(0),
+    ];
   }
   private async getSigner(): Promise<OfflineDirectSigner> {
     if (this.walletType === "injective") {
@@ -90,7 +101,7 @@ export class CosmosClient {
     } else {
       return await DirectSecp256k1HdWallet.fromMnemonic(this.mnemonic, {
         prefix: this.walletPrefix,
-        hdPaths: [stringToPath(`m/44'/${this.coinType}'/0'/0/0`)],
+        hdPaths: [this.generateHdPath(`${this.coinType}`)],
       });
     }
   }
@@ -221,17 +232,9 @@ export class CosmosClient {
     return await this.querier.queryContractSmart(contractAddr, payload);
   }
 
-  async sign(
-    signerAddress: string,
-    messages: readonly MsgExecuteContractEncodeObject[],
-    fee: StdFee,
-    memo: string,
-    explicitSignerData?: SignerData,
-  ): Promise<TxRaw> {
-    if (isCosmjsClient(this.signingClient!)) {
-      return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
-    } else if (isInjectiveClient(this.signingClient!)) {
-      const injMessages = messages.map((msg: MsgExecuteContractEncodeObject) => {
+  private transformMsgs(msgs: readonly EncodeObject[]): Msgs[] {
+    return msgs.map((msg: EncodeObject) => {
+      if (msg.typeUrl.indexOf("MsgExecuteContract") > -1) {
         return InjectiveMsgExecuteContract.fromJSON({
           sender: this.cosmosAddress!,
           contractAddress: msg.value.contract!,
@@ -241,7 +244,27 @@ export class CosmosClient {
               : msg.value.msg,
           funds: msg.value.funds,
         });
-      });
+      } else if (msg.typeUrl.indexOf("MsgSend") > -1) {
+        return InjectiveMsgSend.fromJSON({
+          srcInjectiveAddress: this.cosmosAddress!,
+          dstInjectiveAddress: msg.value.toAddress,
+          amount: msg.value.amount,
+        });
+      } else throw new Error("Unsupported message type");
+    });
+  }
+
+  async sign(
+    signerAddress: string,
+    messages: readonly EncodeObject[],
+    fee: StdFee,
+    memo: string,
+    explicitSignerData?: SignerData,
+  ): Promise<TxRaw> {
+    if (isCosmjsClient(this.signingClient!)) {
+      return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
+    } else if (isInjectiveClient(this.signingClient!)) {
+      const injMessages = this.transformMsgs(messages);
       const tx = {
         msgs: injMessages,
         injectiveAddress: this.cosmosAddress!,
@@ -297,6 +320,39 @@ export class CosmosClient {
       };
     }
     throw new Error("Client not supported for broadcasting");
+  }
+
+  async signAndBroadcast(msgs: EncodeObject[], memo?: string, fee?: StdFee): Promise<DeliverTxResponse> {
+    if (isCosmjsClient(this.signingClient)) {
+      return this.signingClient!.signAndBroadcast(this.cosmosAddress!, msgs, fee || "auto", memo);
+    } else if (isInjectiveClient(this.signingClient)) {
+      const estimatedGas = new Decimal((await this.simulateFees(msgs)).gas).mul(this.gasAdjustment);
+      const estimatedFees = estimatedGas.mul(this.gasPrice);
+      const fees: StdFee = {
+        amount: [
+          {
+            amount: estimatedFees.toFixed(0),
+            denom: this.gasDenom,
+          },
+        ],
+        gas: estimatedGas.toFixed(0),
+        granter: this.granter,
+      };
+
+      const account = await this.getAccount();
+      if (!account) {
+        throw new Error("Account not found");
+      }
+      const { sequence, accountNumber } = account;
+
+      const signedTx: TxRaw = await this.sign(this.cosmosAddress!, msgs, fees, "empty wallet", {
+        accountNumber,
+        sequence: sequence + 1,
+        chainId: this.chainId,
+      });
+      return await this.broadcast(signedTx);
+    }
+    throw new Error("Client not supported for signing and broadcasting");
   }
 
   async getAccount(): Promise<{ accountNumber: number; sequence: number } | null> {
@@ -358,7 +414,7 @@ export class CosmosClient {
 
     return response.transactionHash;
   }
-  async simulateFees(msgs: MsgExecuteContractEncodeObject[]): Promise<StdFee> {
+  async simulateFees(msgs: EncodeObject[]): Promise<StdFee> {
     if (isCosmjsClient(this.signingClient!)) {
       const gas = await this.signingClient.simulate(this.cosmosAddress!, msgs as EncodeObject[], undefined);
       return {
@@ -372,18 +428,7 @@ export class CosmosClient {
         granter: this.granter,
       } as StdFee;
     } else if (isInjectiveClient(this.signingClient!)) {
-      const injMessages = msgs.map((msg: MsgExecuteContractEncodeObject) => {
-        return InjectiveMsgExecuteContract.fromJSON({
-          sender: this.cosmosAddress!,
-          contractAddress: msg.value.contract!,
-          msg:
-            msg.value.msg instanceof Uint8Array
-              ? JSON.parse(Buffer.from(msg.value.msg).toString("utf-8"))
-              : msg.value.msg,
-          funds: msg.value.funds,
-        });
-      });
-
+      const injMessages = this.transformMsgs(msgs);
       const fees = await this.signingClient.simulate({
         msgs: injMessages,
         injectiveAddress: this.cosmosAddress!,
