@@ -15,6 +15,7 @@ import {
   MsgBroadcasterWithPk,
   Msgs,
   PrivateKey,
+  PublicKey,
   TxGrpcApi,
   TxRestClient,
   createSignDocFromTransaction,
@@ -85,7 +86,7 @@ export class CosmosClient {
   gasPrice: number;
   gasAdjustment: number;
   walletType: "cosmos" | "injective";
-  signingClient?: any;
+  signingClient?: SigningCosmWasmClient | MsgBroadcasterWithPk;
   querier?: CosmWasmClient;
   cosmosAddress?: string;
   granter?: string;
@@ -125,6 +126,7 @@ export class CosmosClient {
     if ((!options.mnemonic || options.mnemonic.length === 0) && !options.signer) {
       throw new Error(`Missing mnemonic (or signer)`);
     }
+    options.mnemonic = options.mnemonic || "";
     const selectedChainInfo = chains.find((c) => c.chain_id === options.chainId);
     if (selectedChainInfo !== undefined) {
       if (options.rpcEndpoint !== undefined && options.rpcEndpoint.length > 0) {
@@ -274,39 +276,42 @@ export class CosmosClient {
     fee?: StdFee,
     explicitSignerData?: SignerData,
   ): Promise<[CreateTransactionResult, { accountNumber: number; sequence: number }]> {
-    const injMessages = this.transformMsgs(messages);
-    const tx = {
-      msgs: injMessages,
-      injectiveAddress: this.cosmosAddress!,
-      memo,
-      gas: fee as any,
-    } as MsgBroadcasterTxOptions;
-    const publicKey = this.signer
-      ? // @ts-ignore
-        window[this.browserWallet].getKey(this.chainId)
-      : this.signingClient.privateKey.toPublicKey();
-    const account = explicitSignerData ? { ...explicitSignerData } : await this.getAccount();
-    if (!account) {
-      throw new Error("Account not found");
+    if (isInjectiveClient(this.signingClient)) {
+      const injMessages = this.transformMsgs(messages);
+      const tx = {
+        msgs: injMessages,
+        injectiveAddress: this.cosmosAddress!,
+        memo,
+        gas: fee as any,
+      } as MsgBroadcasterTxOptions;
+      const publicKey = this.signer
+        ? // @ts-ignore
+          PublicKey.fromBytes(window[this.browserWallet].getKey(this.chainId))
+        : this.signingClient.privateKey.toPublicKey();
+      const account = explicitSignerData ? { ...explicitSignerData } : await this.getAccount();
+      if (!account) {
+        throw new Error("Account not found");
+      }
+      const chainRestTendermintApi = new ChainRestTendermintApi(this.endpoints.rest);
+      const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
+      const latestHeight = latestBlock.header.height;
+      const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
+      const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
+      return [
+        createTransaction({
+          memo: tx.memo || "",
+          message: injMessages,
+          fee: getStdFee({ ...tx.gas, gas }),
+          timeoutHeight: timeoutHeight.toNumber(),
+          pubKey: publicKey.toBase64(),
+          sequence: account.sequence,
+          accountNumber: account.accountNumber,
+          chainId: this.chainId,
+        }),
+        account,
+      ];
     }
-    const chainRestTendermintApi = new ChainRestTendermintApi(this.endpoints.rest);
-    const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
-    const latestHeight = latestBlock.header.height;
-    const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
-    const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
-    return [
-      createTransaction({
-        memo: tx.memo || "",
-        message: injMessages,
-        fee: getStdFee({ ...tx.gas, gas }),
-        timeoutHeight: timeoutHeight.toNumber(),
-        pubKey: publicKey.toBase64(),
-        sequence: account.sequence,
-        accountNumber: account.accountNumber,
-        chainId: this.chainId,
-      }),
-      account,
-    ];
+    throw new Error("Unsupported signing client");
   }
 
   async sign(
@@ -316,9 +321,9 @@ export class CosmosClient {
     memo: string,
     explicitSignerData?: SignerData,
   ): Promise<TxRaw> {
-    if (isCosmjsClient(this.signingClient!)) {
+    if (isCosmjsClient(this.signingClient)) {
       return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
-    } else if (isInjectiveClient(this.signingClient!)) {
+    } else if (isInjectiveClient(this.signingClient)) {
       const [{ signBytes, txRaw }, account] = await this.prepareTxRaw(messages, memo, fee, explicitSignerData);
 
       if (this.signer) {
@@ -412,7 +417,7 @@ export class CosmosClient {
 
   async tx(contract: string, payload: any): Promise<string> {
     let response: any;
-    if (isCosmjsClient(this.signingClient!)) {
+    if (isCosmjsClient(this.signingClient)) {
       const msgs: MsgExecuteContractEncodeObject[] = [
         {
           typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
@@ -425,7 +430,7 @@ export class CosmosClient {
       ];
       const fees = await this.simulateFees(msgs);
       response = await this.signingClient.signAndBroadcast(this.cosmosAddress!, msgs, fees);
-    } else if (isInjectiveClient(this.signingClient!)) {
+    } else if (isInjectiveClient(this.signingClient)) {
       const msgs: InjectiveMsgExecuteContract[] = [
         InjectiveMsgExecuteContract.fromJSON({
           sender: this.cosmosAddress!,
@@ -457,7 +462,7 @@ export class CosmosClient {
     return response.transactionHash;
   }
   async simulateFees(msgs: EncodeObject[]): Promise<StdFee> {
-    if (isCosmjsClient(this.signingClient!)) {
+    if (isCosmjsClient(this.signingClient)) {
       const gas = await this.signingClient.simulate(this.cosmosAddress!, msgs as EncodeObject[], undefined);
       return {
         amount: [
@@ -469,7 +474,7 @@ export class CosmosClient {
         gas: Math.ceil(gas * this.gasAdjustment!).toString(),
         granter: this.granter,
       } as StdFee;
-    } else if (isInjectiveClient(this.signingClient!)) {
+    } else if (isInjectiveClient(this.signingClient)) {
       const txClient = new TxRestClient(this.endpoints.rest);
       const [{ txRaw }] = await this.prepareTxRaw(msgs);
       const fees = await txClient.simulate(txRaw);
