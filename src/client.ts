@@ -27,7 +27,6 @@ import { BigNumberInBase, DEFAULT_BLOCK_TIMEOUT_HEIGHT, getStdFee } from "@injec
 import { chains } from "chain-registry";
 import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
-import { isCosmjsClient, isInjectiveClient } from "./utils";
 import Decimal from "decimal.js";
 import Long from "long";
 
@@ -276,7 +275,7 @@ export class CosmosClient {
     fee?: StdFee,
     explicitSignerData?: SignerData,
   ): Promise<[CreateTransactionResult, { accountNumber: number; sequence: number }]> {
-    if (isInjectiveClient(this.signingClient)) {
+    if (this.walletType === "injective") {
       const injMessages = this.transformMsgs(messages);
       const tx = {
         msgs: injMessages,
@@ -287,7 +286,7 @@ export class CosmosClient {
       const publicKey = this.signer
         ? // @ts-ignore
           PublicKey.fromBytes(window[this.browserWallet].getKey(this.chainId))
-        : this.signingClient.privateKey.toPublicKey();
+        : (this.signingClient as MsgBroadcasterWithPk).privateKey.toPublicKey();
       const account = explicitSignerData ? { ...explicitSignerData } : await this.getAccount();
       if (!account) {
         throw new Error("Account not found");
@@ -321,9 +320,9 @@ export class CosmosClient {
     memo: string,
     explicitSignerData?: SignerData,
   ): Promise<TxRaw> {
-    if (isCosmjsClient(this.signingClient)) {
-      return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
-    } else if (isInjectiveClient(this.signingClient)) {
+    if (this.walletType === "cosmos") {
+      return (this.signingClient as SigningCosmWasmClient).sign(signerAddress, messages, fee, memo, explicitSignerData);
+    } else if (this.walletType === "injective") {
       const [{ signBytes, txRaw }, account] = await this.prepareTxRaw(messages, memo, fee, explicitSignerData);
 
       if (this.signer) {
@@ -339,7 +338,7 @@ export class CosmosClient {
         });
         return createTxRawFromSigResponse(directSignResponse);
       } else {
-        const signature = await this.signingClient.privateKey.sign(Buffer.from(signBytes));
+        const signature = await (this.signingClient as MsgBroadcasterWithPk).privateKey.sign(Buffer.from(signBytes));
         txRaw.signatures = [signature];
         return txRaw;
       }
@@ -349,10 +348,10 @@ export class CosmosClient {
   }
 
   async broadcast(txRaw: TxRaw): Promise<DeliverTxResponse> {
-    if (isCosmjsClient(this.signingClient)) {
+    if (this.walletType === "cosmos") {
       const bytes = TxRaw.encode(txRaw).finish();
-      return await this.signingClient.broadcastTx(bytes);
-    } else if (isInjectiveClient(this.signingClient)) {
+      return await (this.signingClient as SigningCosmWasmClient).broadcastTx(bytes);
+    } else if (this.walletType === "injective") {
       const txResponse = await new TxGrpcApi(this.endpoints.grpc).broadcast(txRaw);
 
       if (txResponse.code !== 0) {
@@ -370,9 +369,14 @@ export class CosmosClient {
   }
 
   async signAndBroadcast(msgs: EncodeObject[], memo?: string, fee?: StdFee): Promise<DeliverTxResponse> {
-    if (isCosmjsClient(this.signingClient)) {
-      return this.signingClient!.signAndBroadcast(this.cosmosAddress!, msgs, fee || "auto", memo);
-    } else if (isInjectiveClient(this.signingClient)) {
+    if (this.walletType === "cosmos") {
+      return (this.signingClient as SigningCosmWasmClient).signAndBroadcast(
+        this.cosmosAddress!,
+        msgs,
+        fee || "auto",
+        memo,
+      );
+    } else if (this.walletType === "injective") {
       const estimatedGas = new Decimal((await this.simulateFees(msgs)).gas).mul(this.gasAdjustment);
       const estimatedFees = estimatedGas.mul(this.gasPrice);
       const fees: StdFee = {
@@ -403,9 +407,9 @@ export class CosmosClient {
   }
 
   async getAccount(): Promise<{ accountNumber: number; sequence: number } | null> {
-    if (isCosmjsClient(this.signingClient)) {
-      return await this.signingClient.getAccount(this.cosmosAddress!);
-    } else if (isInjectiveClient(this.signingClient)) {
+    if (this.walletType === "cosmos") {
+      return await (this.signingClient as SigningCosmWasmClient).getAccount(this.cosmosAddress!);
+    } else if (this.walletType === "injective") {
       const chainRestAuthApi = new ChainRestAuthApi(this.endpoints.rest);
       const accountDetailsResponse = await chainRestAuthApi.fetchAccount(this.cosmosAddress!);
       const baseAccount = BaseAccount.fromRestApi(accountDetailsResponse);
@@ -417,7 +421,7 @@ export class CosmosClient {
 
   async tx(contract: string, payload: any): Promise<string> {
     let response: any;
-    if (isCosmjsClient(this.signingClient)) {
+    if (this.walletType === "cosmos") {
       const msgs: MsgExecuteContractEncodeObject[] = [
         {
           typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
@@ -429,8 +433,8 @@ export class CosmosClient {
         },
       ];
       const fees = await this.simulateFees(msgs);
-      response = await this.signingClient.signAndBroadcast(this.cosmosAddress!, msgs, fees);
-    } else if (isInjectiveClient(this.signingClient)) {
+      response = await (this.signingClient as SigningCosmWasmClient).signAndBroadcast(this.cosmosAddress!, msgs, fees);
+    } else if (this.walletType === "injective") {
       const msgs: InjectiveMsgExecuteContract[] = [
         InjectiveMsgExecuteContract.fromJSON({
           sender: this.cosmosAddress!,
@@ -438,7 +442,7 @@ export class CosmosClient {
           msg: typeof payload === "string" ? JSON.parse(payload) : payload,
         }),
       ];
-      const injResponse = await this.signingClient
+      const injResponse = await (this.signingClient as MsgBroadcasterWithPk)
         .broadcast({
           msgs,
           injectiveAddress: this.cosmosAddress!,
@@ -462,8 +466,12 @@ export class CosmosClient {
     return response.transactionHash;
   }
   async simulateFees(msgs: EncodeObject[]): Promise<StdFee> {
-    if (isCosmjsClient(this.signingClient)) {
-      const gas = await this.signingClient.simulate(this.cosmosAddress!, msgs as EncodeObject[], undefined);
+    if (this.walletType === "cosmos") {
+      const gas = await (this.signingClient as SigningCosmWasmClient).simulate(
+        this.cosmosAddress!,
+        msgs as EncodeObject[],
+        undefined,
+      );
       return {
         amount: [
           {
@@ -474,7 +482,7 @@ export class CosmosClient {
         gas: Math.ceil(gas * this.gasAdjustment!).toString(),
         granter: this.granter,
       } as StdFee;
-    } else if (isInjectiveClient(this.signingClient)) {
+    } else if (this.walletType === "injective") {
       const txClient = new TxRestClient(this.endpoints.rest);
       const [{ txRaw }] = await this.prepareTxRaw(msgs);
       const fees = await txClient.simulate(txRaw);
