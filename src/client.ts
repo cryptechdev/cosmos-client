@@ -217,14 +217,15 @@ export class CosmosClient {
     const gasPrice = GasPrice.fromString(`${client.gasPrice}${client.gasDenom}`);
     const tmClient = await Tendermint37Client.connect(client.rpcEndpoint);
     client.querier = await CosmWasmClient.create(tmClient);
+    const network: Network = Network[client.rpcEndpoint.indexOf("testnet") > -1 ? "TestnetK8s" : "MainnetK8s"];
+    client.endpoints = getNetworkEndpoints(network);
+
     if (client.walletType === "cosmos" || client.signer) {
       client.cosmosAddress = (await signer.getAccounts())[0].address;
       client.signingClient = await SigningCosmWasmClient.createWithSigner(tmClient, signer, {
         gasPrice,
       });
     } else if (client.walletType === "injective") {
-      const network: Network = Network[client.rpcEndpoint.indexOf("testnet") > -1 ? "TestnetK8s" : "MainnetK8s"];
-      client.endpoints = getNetworkEndpoints(network);
       const privateKey = client.getPrivateKey();
       client.cosmosAddress = privateKey.toAddress().toBech32(client.walletPrefix);
       client.signingClient = new MsgBroadcasterWithPk({
@@ -396,7 +397,7 @@ export class CosmosClient {
       }
       const { sequence, accountNumber } = account;
 
-      const signedTx: TxRaw = await this.sign(this.cosmosAddress!, msgs, fees, "empty wallet", {
+      const signedTx: TxRaw = await this.sign(this.cosmosAddress!, msgs, fees, memo || "", {
         accountNumber,
         sequence: sequence + 1,
         chainId: this.chainId,
