@@ -8,6 +8,7 @@ import {
   BaseAccount,
   ChainRestAuthApi,
   ChainRestTendermintApi,
+  CreateTransactionResult,
   InjectiveDirectEthSecp256k1Wallet,
   MsgExecuteContract as InjectiveMsgExecuteContract,
   MsgSend as InjectiveMsgSend,
@@ -15,6 +16,7 @@ import {
   Msgs,
   PrivateKey,
   TxGrpcApi,
+  TxRestClient,
   createSignDocFromTransaction,
   createTransaction,
   createTxRawFromSigResponse,
@@ -266,6 +268,47 @@ export class CosmosClient {
     });
   }
 
+  private async prepareTxRaw(
+    messages: readonly EncodeObject[],
+    memo: string = "",
+    fee?: StdFee,
+    explicitSignerData?: SignerData,
+  ): Promise<[CreateTransactionResult, { accountNumber: number; sequence: number }]> {
+    const injMessages = this.transformMsgs(messages);
+    const tx = {
+      msgs: injMessages,
+      injectiveAddress: this.cosmosAddress!,
+      memo,
+      gas: fee as any,
+    } as MsgBroadcasterTxOptions;
+    const publicKey = this.signer
+      ? // @ts-ignore
+        window[this.browserWallet].getKey(this.chainId)
+      : this.signingClient.privateKey.toPublicKey();
+    const account = explicitSignerData ? { ...explicitSignerData } : await this.getAccount();
+    if (!account) {
+      throw new Error("Account not found");
+    }
+    const chainRestTendermintApi = new ChainRestTendermintApi(this.endpoints.rest);
+    const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
+    const latestHeight = latestBlock.header.height;
+    const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
+    const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
+    return [
+      createTransaction({
+        memo: tx.memo || "",
+        message: injMessages,
+        fee: getStdFee({ ...tx.gas, gas }),
+        timeoutHeight: timeoutHeight.toNumber(),
+        pubKey: publicKey.toBase64(),
+        sequence: account.sequence,
+        accountNumber: account.accountNumber,
+        chainId: this.chainId,
+      }),
+      account,
+    ];
+  }
+
   async sign(
     signerAddress: string,
     messages: readonly EncodeObject[],
@@ -276,36 +319,7 @@ export class CosmosClient {
     if (isCosmjsClient(this.signingClient!)) {
       return this.signingClient!.sign(signerAddress, messages, fee, memo, explicitSignerData);
     } else if (isInjectiveClient(this.signingClient!)) {
-      const injMessages = this.transformMsgs(messages);
-      const tx = {
-        msgs: injMessages,
-        injectiveAddress: this.cosmosAddress!,
-        memo,
-        gas: fee as any,
-      } as MsgBroadcasterTxOptions;
-      const publicKey = this.signer
-        ? // @ts-ignore
-          window[this.browserWallet].getKey(this.chainId)
-        : this.signingClient.privateKey.toPublicKey();
-      const account = await this.getAccount();
-      if (!account) {
-        throw new Error("Account not found");
-      }
-      const chainRestTendermintApi = new ChainRestTendermintApi(this.endpoints.rest);
-      const latestBlock = await chainRestTendermintApi.fetchLatestBlock();
-      const latestHeight = latestBlock.header.height;
-      const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
-      const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
-      let { signBytes, txRaw } = createTransaction({
-        memo: tx.memo || "",
-        message: injMessages,
-        fee: getStdFee({ ...tx.gas, gas }),
-        timeoutHeight: timeoutHeight.toNumber(),
-        pubKey: publicKey.toBase64(),
-        sequence: account.sequence,
-        accountNumber: account.accountNumber,
-        chainId: this.chainId,
-      });
+      const [{ signBytes, txRaw }, account] = await this.prepareTxRaw(messages, memo, fee, explicitSignerData);
 
       if (this.signer) {
         const signDoc = createSignDocFromTransaction({
@@ -318,13 +332,12 @@ export class CosmosClient {
           ...signDoc,
           accountNumber: Long.fromString(signDoc.accountNumber),
         });
-        txRaw = createTxRawFromSigResponse(directSignResponse);
+        return createTxRawFromSigResponse(directSignResponse);
       } else {
         const signature = await this.signingClient.privateKey.sign(Buffer.from(signBytes));
         txRaw.signatures = [signature];
+        return txRaw;
       }
-
-      return txRaw;
     } else {
       throw new Error("Client not supported for signing");
     }
@@ -457,11 +470,9 @@ export class CosmosClient {
         granter: this.granter,
       } as StdFee;
     } else if (isInjectiveClient(this.signingClient!)) {
-      const injMessages = this.transformMsgs(msgs);
-      const fees = await this.signingClient.simulate({
-        msgs: injMessages,
-        injectiveAddress: this.cosmosAddress!,
-      });
+      const txClient = new TxRestClient(this.endpoints.rest);
+      const [{ txRaw }] = await this.prepareTxRaw(msgs);
+      const fees = await txClient.simulate(txRaw);
       return {
         amount: [
           {
