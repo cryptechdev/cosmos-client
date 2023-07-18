@@ -15,7 +15,9 @@ import {
   Msgs,
   PrivateKey,
   TxGrpcApi,
+  createSignDocFromTransaction,
   createTransaction,
+  createTxRawFromSigResponse,
   getGasPriceBasedOnMessage,
 } from "@injectivelabs/sdk-ts";
 import { BigNumberInBase, DEFAULT_BLOCK_TIMEOUT_HEIGHT, getStdFee } from "@injectivelabs/utils";
@@ -24,6 +26,7 @@ import { TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
 import { isCosmjsClient, isInjectiveClient } from "./utils";
 import Decimal from "decimal.js";
+import Long from "long";
 
 export interface MsgBroadcasterTxOptions {
   msgs: Msgs | Msgs[];
@@ -50,6 +53,8 @@ export type CosmosClientOptions = {
   walletType: "cosmos" | "injective";
   endpoints: NetworkEndpoints;
   granter?: string;
+  signer?: OfflineDirectSigner;
+  browserWallet?: string;
 };
 
 export class CosmosClient {
@@ -65,6 +70,8 @@ export class CosmosClient {
     this.walletType = options.walletType;
     this.endpoints = options.endpoints;
     this.granter = options.granter;
+    this.signer = options.signer;
+    this.browserWallet = this.signer ? options.browserWallet : "keplr";
   }
   chainId: string;
   mnemonic: string;
@@ -80,6 +87,8 @@ export class CosmosClient {
   querier?: CosmWasmClient;
   cosmosAddress?: string;
   granter?: string;
+  signer?: OfflineDirectSigner;
+  browserWallet?: string;
   private getPrivateKey(): PrivateKey {
     return PrivateKey.fromMnemonic(this.mnemonic, `m/44'/${this.coinType}'/0'/0/0`);
   }
@@ -93,6 +102,7 @@ export class CosmosClient {
     ];
   }
   private async getSigner(): Promise<OfflineDirectSigner> {
+    if (this.signer) return this.signer;
     if (this.walletType === "injective") {
       const key = this.getPrivateKey();
       return (await InjectiveDirectEthSecp256k1Wallet.fromKey(
@@ -110,8 +120,8 @@ export class CosmosClient {
     if (!options.chainId || options.chainId.length === 0) {
       throw new Error(`Missing chainId`);
     }
-    if (!options.mnemonic || options.mnemonic.length === 0) {
-      throw new Error(`Missing mnemonic`);
+    if ((!options.mnemonic || options.mnemonic.length === 0) && !options.signer) {
+      throw new Error(`Missing mnemonic (or signer)`);
     }
     const selectedChainInfo = chains.find((c) => c.chain_id === options.chainId);
     if (selectedChainInfo !== undefined) {
@@ -204,7 +214,12 @@ export class CosmosClient {
     const gasPrice = GasPrice.fromString(`${client.gasPrice}${client.gasDenom}`);
     const tmClient = await Tendermint37Client.connect(client.rpcEndpoint);
     client.querier = await CosmWasmClient.create(tmClient);
-    if (client.walletType === "injective") {
+    if (client.walletType === "cosmos" || client.signer) {
+      client.cosmosAddress = (await signer.getAccounts())[0].address;
+      client.signingClient = await SigningCosmWasmClient.createWithSigner(tmClient, signer, {
+        gasPrice,
+      });
+    } else if (client.walletType === "injective") {
       const network: Network = Network[client.rpcEndpoint.indexOf("testnet") > -1 ? "TestnetK8s" : "MainnetK8s"];
       client.endpoints = getNetworkEndpoints(network);
       const privateKey = client.getPrivateKey();
@@ -216,10 +231,7 @@ export class CosmosClient {
         simulateTx: true,
       });
     } else {
-      client.cosmosAddress = (await signer.getAccounts())[0].address;
-      client.signingClient = await SigningCosmWasmClient.createWithSigner(tmClient, signer, {
-        gasPrice,
-      });
+      throw new Error("Unsupported wallet type [cosmos, injective]");
     }
     return client;
   }
@@ -271,7 +283,10 @@ export class CosmosClient {
         memo,
         gas: fee as any,
       } as MsgBroadcasterTxOptions;
-      const publicKey = this.signingClient.privateKey.toPublicKey();
+      const publicKey = this.signer
+        ? // @ts-ignore
+          window[this.browserWallet].getKey(this.chainId)
+        : this.signingClient.privateKey.toPublicKey();
       const account = await this.getAccount();
       if (!account) {
         throw new Error("Account not found");
@@ -281,7 +296,7 @@ export class CosmosClient {
       const latestHeight = latestBlock.header.height;
       const timeoutHeight = new BigNumberInBase(latestHeight).plus(DEFAULT_BLOCK_TIMEOUT_HEIGHT);
       const gas = (tx.gas?.gas || getGasPriceBasedOnMessage(injMessages)).toString();
-      const { signBytes, txRaw } = createTransaction({
+      let { signBytes, txRaw } = createTransaction({
         memo: tx.memo || "",
         message: injMessages,
         fee: getStdFee({ ...tx.gas, gas }),
@@ -291,9 +306,23 @@ export class CosmosClient {
         accountNumber: account.accountNumber,
         chainId: this.chainId,
       });
-      const signature = await this.signingClient.privateKey.sign(Buffer.from(signBytes));
 
-      txRaw.signatures = [signature];
+      if (this.signer) {
+        const signDoc = createSignDocFromTransaction({
+          txRaw,
+          accountNumber: account.accountNumber,
+          chainId: this.chainId,
+        });
+
+        const directSignResponse = await this.signer.signDirect(this.cosmosAddress!, {
+          ...signDoc,
+          accountNumber: Long.fromString(signDoc.accountNumber),
+        });
+        txRaw = createTxRawFromSigResponse(directSignResponse);
+      } else {
+        const signature = await this.signingClient.privateKey.sign(Buffer.from(signBytes));
+        txRaw.signatures = [signature];
+      }
 
       return txRaw;
     } else {
