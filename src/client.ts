@@ -1,4 +1,4 @@
-import { encodeSecp256k1Pubkey } from "@cosmjs/amino";
+import { Pubkey, SinglePubkey, encodeSecp256k1Pubkey } from "@cosmjs/amino";
 import { CosmWasmClient, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
 import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { fromBase64 } from "@cosmjs/encoding";
@@ -20,10 +20,7 @@ import {
 } from "@cosmjs/stargate";
 import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
 import { InjectiveTypesV1Beta1Account } from "@injectivelabs/core-proto-ts";
-import {
-  InjectiveDirectEthSecp256k1Wallet,
-  PrivateKey
-} from "@injectivelabs/sdk-ts";
+import { InjectiveDirectEthSecp256k1Wallet, PrivateKey } from "@injectivelabs/sdk-ts";
 import { chains } from "chain-registry";
 import { QueryAccountRequest, QueryClientImpl } from "cosmjs-types/cosmos/auth/v1beta1/query";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
@@ -249,26 +246,31 @@ export class CosmosClient {
     return await this.broadcast(signedTx);
   }
 
-  async getAccount(): Promise<{ accountNumber: number; sequence: number } | null> {
-    if (this.walletType === "cosmos") {
-      const response = await (this.signingClient as SigningCosmWasmClient).getAccount(this.cosmosAddress!);
+  async getAccount(
+    addr: string,
+    isEthAccount: boolean = false,
+  ): Promise<{ accountNumber: number; sequence: number; pubkey: Pubkey } | null> {
+    if (!isEthAccount) {
+      const response = await (this.signingClient as SigningCosmWasmClient).getAccount(addr);
       if (!response || !response.pubkey) {
         return null;
       }
       return {
         accountNumber: response.accountNumber,
         sequence: response.sequence,
+        pubkey: response.pubkey,
       };
-    } else if (this.walletType === "injective") {
+    } else if (isEthAccount) {
       const client = new QueryClient(this.tmClient!);
       const rpc = createProtobufRpcClient(client);
       const queryService = new QueryClientImpl(rpc);
-      const response = await queryService.Account(QueryAccountRequest.fromPartial({ address: this.cosmosAddress! }));
+      const response = await queryService.Account(QueryAccountRequest.fromPartial({ address: addr }));
       const decodedResponse = InjectiveTypesV1Beta1Account.EthAccount.decode(response.account!.value);
 
       return {
         accountNumber: Number(decodedResponse.baseAccount!.accountNumber),
         sequence: Number(decodedResponse.baseAccount!.sequence),
+        pubkey: decodedResponse.baseAccount?.pubKey as unknown as SinglePubkey,
       };
     }
     return null;
@@ -296,7 +298,7 @@ export class CosmosClient {
           accountNumber: explicitSignerData.accountNumber,
           sequence: explicitSignerData.sequence,
         }
-      : await this.getAccount();
+      : await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
     if (account === null) throw new Error("Account not found");
 
     const { sequence, accountNumber } = account;
@@ -364,7 +366,7 @@ export class CosmosClient {
     const client = new QueryClient(this.tmClient!);
     const rpc = createProtobufRpcClient(client);
     const queryService = new ServiceClientImpl(rpc);
-    const account = await this.getAccount();
+    const account = await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
     if (account === null) throw new Error("Account not found");
 
     const { sequence } = account;
