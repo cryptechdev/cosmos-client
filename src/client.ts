@@ -270,7 +270,10 @@ export class CosmosClient {
       return {
         accountNumber: Number(decodedResponse.baseAccount!.accountNumber),
         sequence: Number(decodedResponse.baseAccount!.sequence),
-        pubkey: decodedResponse.baseAccount?.pubKey as unknown as SinglePubkey,
+        pubkey: {
+          type: decodedResponse.baseAccount?.pubKey?.typeUrl || "",
+          value: decodedResponse.baseAccount?.pubKey?.value,
+        },
       };
     }
     return null;
