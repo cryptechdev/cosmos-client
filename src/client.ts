@@ -323,7 +323,7 @@ export class CosmosClient {
         sequence: Number(decodedResponse.baseAccount!.sequence),
         pubkey: {
           type: decodedResponse.baseAccount?.pubKey?.typeUrl || "",
-          value: decodedResponse.baseAccount?.pubKey?.value,
+          value: Buffer.from(decodedResponse.baseAccount?.pubKey?.value || []).toString("base64"),
         },
       };
     }
