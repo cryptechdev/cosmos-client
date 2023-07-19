@@ -4,7 +4,7 @@ import { chains } from "chain-registry";
 
 describe("CosmosClient", () => {
   test("new cosmos client", async () => {
-    const chain = chains.find((c) => c.chain_id === "osmosis-1")!;
+    const chain = chains.find((c) => c.chain_id === "juno-1")!;
     const mnemonic = (await DirectSecp256k1HdWallet.generate(12)).mnemonic;
     const client = await CosmosClient.new({
       mnemonic,
