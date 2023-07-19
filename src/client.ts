@@ -303,13 +303,13 @@ export class CosmosClient {
   ): Promise<{ accountNumber: number; sequence: number; pubkey: Pubkey } | null> {
     if (!isEthAccount) {
       const response = await (this.signingClient as SigningCosmWasmClient).getAccount(addr);
-      if (!response || !response.pubkey) {
+      if (!response) {
         return null;
       }
       return {
         accountNumber: response.accountNumber,
         sequence: response.sequence,
-        pubkey: response.pubkey,
+        pubkey: response.pubkey ? response.pubkey : { type: "", value: "" },
       };
     } else if (isEthAccount) {
       const client = new QueryClient(this.tmClient!);
