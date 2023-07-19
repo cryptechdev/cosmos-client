@@ -1,4 +1,10 @@
-import { OfflineAminoSigner, Pubkey, encodeSecp256k1Pubkey, makeSignDoc as makeSignDocAmino } from "@cosmjs/amino";
+import {
+  OfflineAminoSigner,
+  Pubkey,
+  SinglePubkey,
+  encodeSecp256k1Pubkey,
+  makeSignDoc as makeSignDocAmino,
+} from "@cosmjs/amino";
 import { CosmWasmClient, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
 import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { fromBase64 } from "@cosmjs/encoding";
@@ -24,7 +30,13 @@ import {
 } from "@cosmjs/stargate";
 import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
 import { InjectiveTypesV1Beta1Account } from "@injectivelabs/core-proto-ts";
-import { InjectiveDirectEthSecp256k1Wallet, PrivateKey } from "@injectivelabs/sdk-ts";
+import {
+  BaseAccount,
+  ChainRestAuthApi,
+  InjectiveDirectEthSecp256k1Wallet,
+  PrivateKey,
+  getPublicKey,
+} from "@injectivelabs/sdk-ts";
 import { chains } from "chain-registry";
 import { QueryAccountRequest, QueryClientImpl } from "cosmjs-types/cosmos/auth/v1beta1/query";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
@@ -323,7 +335,9 @@ export class CosmosClient {
         sequence: Number(decodedResponse.baseAccount!.sequence),
         pubkey: {
           type: decodedResponse.baseAccount?.pubKey?.typeUrl || "",
-          value: Buffer.from(decodedResponse.baseAccount?.pubKey?.value || []).toString("base64"),
+          value: Buffer.from(decodedResponse.baseAccount?.pubKey?.value || [])
+            .slice(2)
+            .toString("base64"),
         },
       };
     }
