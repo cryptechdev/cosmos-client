@@ -1,6 +1,6 @@
 {
   "name": "@cryptech/cosmos-client",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "A Typescript Cosmos client compatible with Injective and @cosmjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

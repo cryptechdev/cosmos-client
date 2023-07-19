@@ -5,6 +5,17 @@ import { PubKey as CosmosCryptoEd25519Pubkey } from "cosmjs-types/cosmos/crypto/
 import { LegacyAminoPubKey } from "cosmjs-types/cosmos/crypto/multisig/keys";
 import { PubKey as CosmosCryptoSecp256k1Pubkey } from "cosmjs-types/cosmos/crypto/secp256k1/keys";
 import { Any } from "cosmjs-types/google/protobuf/any";
+import {
+  AminoConverters,
+  createAuthzAminoConverters,
+  createBankAminoConverters,
+  createDistributionAminoConverters,
+  createFeegrantAminoConverters,
+  createGovAminoConverters,
+  createIbcAminoConverters,
+  createStakingAminoConverters,
+  createVestingAminoConverters,
+} from "@cosmjs/stargate";
 
 export const encodePubkey = (pubkey: Pubkey, isInjective: boolean = false): Any => {
   if (isSecp256k1Pubkey(pubkey)) {
@@ -44,3 +55,16 @@ export const encodePubkey = (pubkey: Pubkey, isInjective: boolean = false): Any 
     throw new Error(`Pubkey type ${pubkey.type} not recognized`);
   }
 };
+
+export function createDefaultTypes(): AminoConverters {
+  return {
+    ...createAuthzAminoConverters(),
+    ...createBankAminoConverters(),
+    ...createDistributionAminoConverters(),
+    ...createGovAminoConverters(),
+    ...createStakingAminoConverters(),
+    ...createIbcAminoConverters(),
+    ...createFeegrantAminoConverters(),
+    ...createVestingAminoConverters(),
+  };
+}

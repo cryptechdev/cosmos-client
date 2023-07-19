@@ -1,15 +1,19 @@
-import { Pubkey, SinglePubkey, encodeSecp256k1Pubkey } from "@cosmjs/amino";
+import { OfflineAminoSigner, Pubkey, encodeSecp256k1Pubkey, makeSignDoc as makeSignDocAmino } from "@cosmjs/amino";
 import { CosmWasmClient, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
 import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { fromBase64 } from "@cosmjs/encoding";
+import { Int53 } from "@cosmjs/math";
 import {
   DirectSecp256k1HdWallet,
   EncodeObject,
   OfflineDirectSigner,
+  TxBodyEncodeObject,
+  isOfflineDirectSigner,
   makeAuthInfoBytes,
   makeSignDoc,
 } from "@cosmjs/proto-signing";
 import {
+  AminoTypes,
   DeliverTxResponse,
   GasPrice,
   QueryClient,
@@ -27,9 +31,10 @@ import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
 import { ServiceClientImpl, SimulateRequest } from "cosmjs-types/cosmos/tx/v1beta1/service";
 import { AuthInfo, Fee, Tx, TxBody, TxRaw } from "cosmjs-types/cosmos/tx/v1beta1/tx";
 import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
+import { Any } from "cosmjs-types/google/protobuf/any";
 import Decimal from "decimal.js";
 import Long from "long";
-import { encodePubkey } from "./utils";
+import { createDefaultTypes, encodePubkey } from "./utils";
 
 export type CosmosClientOptions = {
   chainId: string;
@@ -42,7 +47,7 @@ export type CosmosClientOptions = {
   gasAdjustment: number | string;
   walletType: "cosmos" | "injective";
   granter?: string;
-  signer?: OfflineDirectSigner;
+  signer?: OfflineDirectSigner | OfflineAminoSigner;
   browserWallet?: string;
 };
 
@@ -74,7 +79,7 @@ export class CosmosClient {
   querier?: CosmWasmClient;
   cosmosAddress?: string;
   granter?: string;
-  signer?: OfflineDirectSigner;
+  signer?: OfflineDirectSigner | OfflineAminoSigner;
   browserWallet?: string;
   tmClient?: Tendermint37Client;
   private getPrivateKey(): PrivateKey {
@@ -89,7 +94,7 @@ export class CosmosClient {
       Slip10RawIndex.normal(0),
     ];
   }
-  private async getSigner(): Promise<OfflineDirectSigner> {
+  private async getSigner(): Promise<OfflineDirectSigner | OfflineAminoSigner> {
     if (this.signer) return this.signer;
     if (this.walletType === "injective") {
       const key = this.getPrivateKey();
@@ -218,22 +223,68 @@ export class CosmosClient {
     return await this.querier.queryContractSmart(contractAddr, payload);
   }
 
-  async sign(messages: readonly EncodeObject[], memo: string, explicitSignerData?: SignerData): Promise<TxRaw> {
+  async sign(
+    signerAddress: string,
+    messages: readonly EncodeObject[],
+    memo: string,
+    fee?: StdFee,
+    explicitSignerData?: SignerData,
+  ): Promise<TxRaw> {
+    if (!this.signingClient) {
+      throw new Error("Client not initialized");
+    }
     const encodedMessages = messages.map((msg) => this.signingClient!.registry.encodeAsAny(msg));
 
-    const { accountNumber, txBodyBytes, authInfoBytes } = await this.prepareTx(
-      encodedMessages,
-      memo,
-      explicitSignerData,
-    );
-    const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, this.chainId, accountNumber);
-    const { signature, signed } = await (await this.getSigner()).signDirect(this.cosmosAddress!, signDoc);
+    const {
+      pubkey,
+      sequence,
+      accountNumber,
+      txBodyBytes,
+      authInfoBytes,
+      fees: estimatedFees,
+    } = await this.prepareTx(encodedMessages, fee, memo, explicitSignerData);
 
-    return TxRaw.fromPartial({
-      bodyBytes: signed.bodyBytes,
-      authInfoBytes: signed.authInfoBytes,
-      signatures: [fromBase64(signature.signature)],
-    });
+    const signer = await this.getSigner();
+    if (isOfflineDirectSigner(signer)) {
+      const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, this.chainId, accountNumber);
+      const { signature, signed } = await signer.signDirect(this.cosmosAddress!, signDoc);
+
+      return TxRaw.fromPartial({
+        bodyBytes: signed.bodyBytes,
+        authInfoBytes: signed.authInfoBytes,
+        signatures: [fromBase64(signature.signature)],
+      });
+    } else {
+      const signMode = SignMode.SIGN_MODE_LEGACY_AMINO_JSON;
+      const aminoTypes = new AminoTypes(createDefaultTypes());
+      const msgs = messages.map((msg) => aminoTypes.toAmino(msg));
+      const signDoc = makeSignDocAmino(msgs, estimatedFees, this.chainId, memo, accountNumber, sequence);
+      const { signature, signed } = await signer.signAmino(signerAddress, signDoc);
+      const signedTxBody = {
+        messages: signed.msgs.map((msg) => aminoTypes.fromAmino(msg)),
+        memo: signed.memo,
+      };
+      const signedTxBodyEncodeObject: TxBodyEncodeObject = {
+        typeUrl: "/cosmos.tx.v1beta1.TxBody",
+        value: signedTxBody,
+      };
+      const signedTxBodyBytes = this.signingClient.registry.encode(signedTxBodyEncodeObject);
+      const signedGasLimit = Int53.fromString(signed.fee.gas).toNumber();
+      const signedSequence = Int53.fromString(signed.sequence).toNumber();
+      const signedAuthInfoBytes = makeAuthInfoBytes(
+        [{ pubkey, sequence: signedSequence }],
+        signed.fee.amount,
+        signedGasLimit,
+        signed.fee.granter,
+        signed.fee.payer,
+        signMode,
+      );
+      return TxRaw.fromPartial({
+        bodyBytes: signedTxBodyBytes,
+        authInfoBytes: signedAuthInfoBytes,
+        signatures: [fromBase64(signature.signature)],
+      });
+    }
   }
 
   async broadcast(txRaw: TxRaw): Promise<DeliverTxResponse> {
@@ -242,7 +293,7 @@ export class CosmosClient {
   }
 
   async signAndBroadcast(msgs: EncodeObject[], memo?: string, fee?: StdFee): Promise<DeliverTxResponse> {
-    const signedTx: TxRaw = await this.sign(msgs, memo || "");
+    const signedTx: TxRaw = await this.sign(this.cosmosAddress!, msgs, memo || "");
     return await this.broadcast(signedTx);
   }
 
@@ -281,6 +332,7 @@ export class CosmosClient {
 
   private async prepareTx(
     msgs: EncodeObject[],
+    fees?: StdFee,
     memo?: string,
     explicitSignerData?: SignerData,
   ): Promise<{
@@ -289,6 +341,7 @@ export class CosmosClient {
     sequence: number;
     txBodyBytes: Uint8Array;
     authInfoBytes: Uint8Array;
+    pubkey: Any;
   }> {
     const txBody = TxBody.fromPartial({
       messages: msgs,
@@ -308,7 +361,7 @@ export class CosmosClient {
     const accountFromSigner = (await (await this.getSigner()).getAccounts())![0];
     const pubkey = encodePubkey(encodeSecp256k1Pubkey(accountFromSigner.pubkey), this.walletType === "injective");
 
-    const fees = await this.simulateFees(msgs);
+    const finalFees = fees || (await this.simulateFees(msgs));
 
     const authInfoBytes = makeAuthInfoBytes(
       [
@@ -317,13 +370,14 @@ export class CosmosClient {
           sequence,
         },
       ],
-      fees.amount,
-      new Decimal(fees.gas).toNumber(),
-      fees.granter,
-      fees.payer,
+      finalFees.amount,
+      new Decimal(finalFees.gas).toNumber(),
+      finalFees.granter,
+      finalFees.payer,
     );
     return {
-      fees,
+      fees: finalFees,
+      pubkey,
       accountNumber,
       sequence,
       txBodyBytes,
@@ -335,29 +389,18 @@ export class CosmosClient {
     if (!this.signingClient || !this.cosmosAddress) {
       throw new Error("Signing client not initialized");
     }
-    let response: any;
     const msgs: EncodeObject[] = [
-      this.signingClient!.registry.encodeAsAny({
+      {
         typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
         value: MsgExecuteContract.fromPartial({
           sender: this.cosmosAddress!,
           contract,
           msg: Buffer.from(JSON.stringify(typeof payload === "string" ? JSON.parse(payload) : payload)),
         }),
-      }),
+      },
     ];
 
-    const { accountNumber, txBodyBytes, authInfoBytes } = await this.prepareTx(msgs);
-
-    const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, this.chainId, accountNumber);
-    const { signature, signed } = await (await this.getSigner()).signDirect(this.cosmosAddress!, signDoc);
-    const txRaw = TxRaw.fromPartial({
-      bodyBytes: signed.bodyBytes,
-      authInfoBytes: signed.authInfoBytes,
-      signatures: [fromBase64(signature.signature)],
-    });
-    const txBytes = TxRaw.encode(txRaw).finish();
-    response = await (this.signingClient as SigningCosmWasmClient).broadcastTx(txBytes);
+    const response = await this.signAndBroadcast(msgs);
 
     if (isDeliverTxFailure(response)) {
       throw new Error(`Tx failed: ${response.rawLog}`);
