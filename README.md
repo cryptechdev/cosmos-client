@@ -94,22 +94,3 @@ client = await CosmosClient.new({
   granter: process.env.GRANTER,
 });
 ```
-
-## Supported Messages on Injective
-
-- Bank::MsgSend
-- Wasm::MsgExecuteContract
-
-## Usage for non-Injective Cosmos chains
-
-For non-Injective Cosmos chains, you have to option to use the `CosmosClient.signingClient` directly as it is an instance of CosmWasmSigningClient, which inherits from StargateClient.  
-This allows you to not have to prepare EncodeObjects for messages and instead use the provided functions to create messages and send them directly.
-
-```typescript
-
-const balanceResponse = await client.signingClient.getBalance(address, searchDenom);
-const storeCodeResponse = await client.signingClient.upload(senderAddress, wasmCode, fee);
-const instantiateResponse = await client.signingClient.instantiate(senderAddress, codeId, msg, label, fee);
-...
-
-```
