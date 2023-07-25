@@ -1,1 +1,2 @@
-export { CosmosClient, type CosmosClientOptions } from "./client";
+export { CosmosClient } from "./client";
+export type { CosmosClientOptions } from "./client";
