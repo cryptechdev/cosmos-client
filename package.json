@@ -1,6 +1,6 @@
 {
   "name": "@cryptech/cosmos-client",
-  "version": "2.1.6",
+  "version": "2.2.1",
   "description": "A Typescript Cosmos client compatible with Injective and @cosmjs",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -44,7 +44,7 @@
     "@cosmjs/proto-signing": "^0.30",
     "@cosmjs/stargate": "^0.30",
     "@cosmjs/tendermint-rpc": "^0.30",
-    "@injectivelabs/sdk-ts": "^1.12.0-beta.35",
+    "@injectivelabs/sdk-ts": "^1.12.0-beta.89",
     "axios": "^0.27.2",
     "chain-registry": "^1.14.0",
     "decimal.js": "^10.4.3"

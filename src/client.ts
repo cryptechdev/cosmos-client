@@ -5,7 +5,7 @@ import {
   encodeSecp256k1Pubkey,
   makeSignDoc as makeSignDocAmino,
 } from "@cosmjs/amino";
-import { CosmWasmClient, SigningCosmWasmClient } from "@cosmjs/cosmwasm-stargate";
+import { CosmWasmClient, SigningCosmWasmClient, createWasmAminoConverters } from "@cosmjs/cosmwasm-stargate";
 import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { fromBase64 } from "@cosmjs/encoding";
 import { Int53 } from "@cosmjs/math";
@@ -268,7 +268,7 @@ export class CosmosClient {
       });
     } else {
       const signMode = SignMode.SIGN_MODE_LEGACY_AMINO_JSON;
-      const aminoTypes = new AminoTypes(createDefaultTypes());
+      const aminoTypes = new AminoTypes({ ...createDefaultTypes(), ...createWasmAminoConverters() });
       const msgs = messages.map((msg) => aminoTypes.toAmino(msg));
       const signDoc = makeSignDocAmino(msgs, estimatedFees, this.chainId, memo, accountNumber, sequence);
       const { signature, signed } = await signer.signAmino(signerAddress, signDoc);

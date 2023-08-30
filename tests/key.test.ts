@@ -12,7 +12,7 @@ describe("Key", () => {
       mnemonic,
       chainId: chain.chain_id,
     } as Partial<CosmosClientOptions>);
-    const txClient = new TxClient()
+    const txClient = new TxClient();
     const account = await client.getAccount(client.cosmosAddress!, true);
     console.log(account);
     expect(account).toBeDefined();
@@ -27,7 +27,7 @@ describe("Key", () => {
       chainId: chain.chain_id,
     } as Partial<CosmosClientOptions>);
     console.log(client.cosmosAddress);
-    
+
     const account = await client.getAccount(client.cosmosAddress!, false);
     console.log(account);
     expect(account).toBeDefined();
