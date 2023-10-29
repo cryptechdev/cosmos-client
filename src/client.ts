@@ -47,12 +47,14 @@ import { Any } from "cosmjs-types/google/protobuf/any";
 import Decimal from "decimal.js";
 import Long from "long";
 import { createDefaultTypes, encodePubkey } from "./utils";
+import { wait } from "ts-retry";
 
 export type CosmosClientOptions = {
   chainId: string;
   mnemonic: string;
   walletPrefix: string;
   rpcEndpoint: string;
+  rpcEndpoints: string[];
   coinType: number | string;
   gasDenom: string;
   gasPrice: number | string;
@@ -61,6 +63,7 @@ export type CosmosClientOptions = {
   granter?: string;
   signer?: OfflineDirectSigner | OfflineAminoSigner;
   browserWallet?: string;
+  connectionTimeout?: number;
 };
 
 export class CosmosClient {
@@ -69,6 +72,7 @@ export class CosmosClient {
     this.mnemonic = options.mnemonic;
     this.walletPrefix = options.walletPrefix;
     this.rpcEndpoint = options.rpcEndpoint;
+    this.rpcEndpoints = options.rpcEndpoints;
     this.coinType = Number(options.coinType);
     this.gasDenom = options.gasDenom;
     this.gasPrice = Number(options.gasPrice);
@@ -77,11 +81,13 @@ export class CosmosClient {
     this.granter = options.granter;
     this.signer = options.signer;
     this.browserWallet = this.signer ? options.browserWallet : "keplr";
+    this.connectionTimeout = options.connectionTimeout || 30_000;
   }
   chainId: string;
   mnemonic: string;
   walletPrefix: string;
   rpcEndpoint: string;
+  rpcEndpoints: string[];
   coinType: number;
   gasDenom: string;
   gasPrice: number;
@@ -94,6 +100,8 @@ export class CosmosClient {
   signer?: OfflineDirectSigner | OfflineAminoSigner;
   browserWallet?: string;
   tmClient?: Tendermint37Client;
+  connectionErrors: number = 0;
+  connectionTimeout: number = 30000;
   private getPrivateKey(): PrivateKey {
     return PrivateKey.fromMnemonic(this.mnemonic, `m/44'/${this.coinType}'/0'/0/0`);
   }
@@ -216,23 +224,60 @@ export class CosmosClient {
     const options = CosmosClient.sanitizeOptions(opts);
 
     const client = new CosmosClient(options as CosmosClientOptions);
+    if (client.rpcEndpoint.indexOf(",") > -1) {
+      client.rpcEndpoints = client.rpcEndpoint.split(",");
+      client.rpcEndpoint = client.rpcEndpoints[0];
+    } else {
+      client.rpcEndpoints = [client.rpcEndpoint];
+    }
     const signer = await client.getSigner();
     const gasPrice = GasPrice.fromString(`${client.gasPrice}${client.gasDenom}`);
-    client.tmClient = await Tendermint37Client.connect(client.rpcEndpoint);
-    client.querier = await CosmWasmClient.create(client.tmClient);
+    await client.setClients(client.rpcEndpoint);
     client.cosmosAddress = (await signer.getAccounts())[0].address;
-    client.signingClient = await SigningCosmWasmClient.createWithSigner(client.tmClient, signer, {
+    client.signingClient = await SigningCosmWasmClient.createWithSigner(client.tmClient!, signer, {
       gasPrice,
     });
     return client;
   }
+
+  private async setClients(endpoint: string) {
+    try {
+      this.tmClient = await Tendermint37Client.connect(endpoint);
+      this.querier = await CosmWasmClient.create(this.tmClient);
+    } catch (e) {
+      this.addConnectionFailure();
+    }
+  }
+
+  private async addConnectionFailure() {
+    this.connectionErrors++;
+    if (this.connectionErrors > this.rpcEndpoints.length) {
+      await wait(this.connectionTimeout);
+      this.connectionErrors = 0;
+    }
+    this.rotateEndpoint();
+    await wait(3000);
+    await this.setClients(this.rpcEndpoint);
+  }
+
+  private rotateEndpoint() {
+    const activeEndpointIndex = this.rpcEndpoints.indexOf(this.rpcEndpoint);
+    const nextEndpointIndex = (activeEndpointIndex + 1) % this.rpcEndpoints.length;
+    this.rpcEndpoint = this.rpcEndpoints[nextEndpointIndex];
+  }
+
   async query(contractAddr: string, params: any): Promise<any> {
     if (!this.querier) {
       throw new Error("Client not initialized");
     }
 
     const payload = typeof params === "string" ? JSON.parse(params) : params;
-    return await this.querier.queryContractSmart(contractAddr, payload);
+    try {
+      const response = await this.querier.queryContractSmart(contractAddr, payload);
+      return response;
+    } catch (e) {
+      this.addConnectionFailure();
+    }
   }
 
   async sign(
@@ -245,103 +290,126 @@ export class CosmosClient {
     if (!this.signingClient) {
       throw new Error("Client not initialized");
     }
-    const encodedMessages = messages.map((msg) => this.signingClient!.registry.encodeAsAny(msg));
 
-    const {
-      pubkey,
-      sequence,
-      accountNumber,
-      txBodyBytes,
-      authInfoBytes,
-      fees: estimatedFees,
-    } = await this.prepareTx(encodedMessages, fee, memo, explicitSignerData);
+    try {
+      const encodedMessages = messages.map((msg) => this.signingClient!.registry.encodeAsAny(msg));
 
-    const signer = await this.getSigner();
-    if (isOfflineDirectSigner(signer)) {
-      const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, this.chainId, accountNumber);
-      const { signature, signed } = await signer.signDirect(this.cosmosAddress!, signDoc);
+      const {
+        pubkey,
+        sequence,
+        accountNumber,
+        txBodyBytes,
+        authInfoBytes,
+        fees: estimatedFees,
+      } = await this.prepareTx(encodedMessages, fee, memo, explicitSignerData);
 
-      return TxRaw.fromPartial({
-        bodyBytes: signed.bodyBytes,
-        authInfoBytes: signed.authInfoBytes,
-        signatures: [fromBase64(signature.signature)],
-      });
-    } else {
-      const signMode = SignMode.SIGN_MODE_LEGACY_AMINO_JSON;
-      const aminoTypes = new AminoTypes({ ...createDefaultTypes(), ...createWasmAminoConverters() });
-      const msgs = messages.map((msg) => aminoTypes.toAmino(msg));
-      const signDoc = makeSignDocAmino(msgs, estimatedFees, this.chainId, memo, accountNumber, sequence);
-      const { signature, signed } = await signer.signAmino(signerAddress, signDoc);
-      const signedTxBody = {
-        messages: signed.msgs.map((msg) => aminoTypes.fromAmino(msg)),
-        memo: signed.memo,
-      };
-      const signedTxBodyEncodeObject: TxBodyEncodeObject = {
-        typeUrl: "/cosmos.tx.v1beta1.TxBody",
-        value: signedTxBody,
-      };
-      const signedTxBodyBytes = this.signingClient.registry.encode(signedTxBodyEncodeObject);
-      const signedGasLimit = Int53.fromString(signed.fee.gas).toNumber();
-      const signedSequence = Int53.fromString(signed.sequence).toNumber();
-      const signedAuthInfoBytes = makeAuthInfoBytes(
-        [{ pubkey, sequence: signedSequence }],
-        signed.fee.amount,
-        signedGasLimit,
-        signed.fee.granter,
-        signed.fee.payer,
-        signMode,
-      );
-      return TxRaw.fromPartial({
-        bodyBytes: signedTxBodyBytes,
-        authInfoBytes: signedAuthInfoBytes,
-        signatures: [fromBase64(signature.signature)],
-      });
+      const signer = await this.getSigner();
+      if (isOfflineDirectSigner(signer)) {
+        const signDoc = makeSignDoc(txBodyBytes, authInfoBytes, this.chainId, accountNumber);
+        const { signature, signed } = await signer.signDirect(this.cosmosAddress!, signDoc);
+
+        return TxRaw.fromPartial({
+          bodyBytes: signed.bodyBytes,
+          authInfoBytes: signed.authInfoBytes,
+          signatures: [fromBase64(signature.signature)],
+        });
+      } else {
+        const signMode = SignMode.SIGN_MODE_LEGACY_AMINO_JSON;
+        const aminoTypes = new AminoTypes({ ...createDefaultTypes(), ...createWasmAminoConverters() });
+        const msgs = messages.map((msg) => aminoTypes.toAmino(msg));
+        const signDoc = makeSignDocAmino(msgs, estimatedFees, this.chainId, memo, accountNumber, sequence);
+        const { signature, signed } = await signer.signAmino(signerAddress, signDoc);
+        const signedTxBody = {
+          messages: signed.msgs.map((msg) => aminoTypes.fromAmino(msg)),
+          memo: signed.memo,
+        };
+        const signedTxBodyEncodeObject: TxBodyEncodeObject = {
+          typeUrl: "/cosmos.tx.v1beta1.TxBody",
+          value: signedTxBody,
+        };
+        const signedTxBodyBytes = this.signingClient.registry.encode(signedTxBodyEncodeObject);
+        const signedGasLimit = Int53.fromString(signed.fee.gas).toNumber();
+        const signedSequence = Int53.fromString(signed.sequence).toNumber();
+        const signedAuthInfoBytes = makeAuthInfoBytes(
+          [{ pubkey, sequence: signedSequence }],
+          signed.fee.amount,
+          signedGasLimit,
+          signed.fee.granter,
+          signed.fee.payer,
+          signMode,
+        );
+        return TxRaw.fromPartial({
+          bodyBytes: signedTxBodyBytes,
+          authInfoBytes: signedAuthInfoBytes,
+          signatures: [fromBase64(signature.signature)],
+        });
+      }
+    } catch (e) {
+      this.addConnectionFailure();
+      return {} as TxRaw;
     }
   }
 
   async broadcast(txRaw: TxRaw): Promise<DeliverTxResponse> {
     const bytes = TxRaw.encode(txRaw).finish();
-    return await (this.signingClient as SigningCosmWasmClient).broadcastTx(bytes);
+    try {
+      const response = await (this.signingClient as SigningCosmWasmClient).broadcastTx(bytes);
+      return response;
+    } catch (e) {
+      this.addConnectionFailure();
+      return {} as DeliverTxResponse;
+    }
   }
 
   async signAndBroadcast(msgs: EncodeObject[], memo?: string, fee?: StdFee): Promise<DeliverTxResponse> {
     const signedTx: TxRaw = await this.sign(this.cosmosAddress!, msgs, memo || "");
-    return await this.broadcast(signedTx);
+    try {
+      const response = await this.broadcast(signedTx);
+      return response;
+    } catch (e) {
+      this.addConnectionFailure();
+      return {} as DeliverTxResponse;
+    }
   }
 
   async getAccount(
     addr: string,
     isEthAccount: boolean = false,
   ): Promise<{ accountNumber: number; sequence: number; pubkey: Pubkey } | null> {
-    if (!isEthAccount) {
-      const response = await (this.signingClient as SigningCosmWasmClient).getAccount(addr);
-      if (!response) {
-        return null;
-      }
-      return {
-        accountNumber: response.accountNumber,
-        sequence: response.sequence,
-        pubkey: response.pubkey ? response.pubkey : { type: "", value: "" },
-      };
-    } else if (isEthAccount) {
-      const client = new QueryClient(this.tmClient!);
-      const rpc = createProtobufRpcClient(client);
-      const queryService = new QueryClientImpl(rpc);
-      const response = await queryService.Account(QueryAccountRequest.fromPartial({ address: addr }));
-      const decodedResponse = InjectiveTypesV1Beta1Account.EthAccount.decode(response.account!.value);
+    try {
+      if (!isEthAccount) {
+        const response = await (this.signingClient as SigningCosmWasmClient).getAccount(addr);
+        if (!response) {
+          return null;
+        }
+        return {
+          accountNumber: response.accountNumber,
+          sequence: response.sequence,
+          pubkey: response.pubkey ? response.pubkey : { type: "", value: "" },
+        };
+      } else if (isEthAccount) {
+        const client = new QueryClient(this.tmClient!);
+        const rpc = createProtobufRpcClient(client);
+        const queryService = new QueryClientImpl(rpc);
+        const response = await queryService.Account(QueryAccountRequest.fromPartial({ address: addr }));
+        const decodedResponse = InjectiveTypesV1Beta1Account.EthAccount.decode(response.account!.value);
 
-      return {
-        accountNumber: Number(decodedResponse.baseAccount!.accountNumber),
-        sequence: Number(decodedResponse.baseAccount!.sequence),
-        pubkey: {
-          type: decodedResponse.baseAccount?.pubKey?.typeUrl || "",
-          value: Buffer.from(decodedResponse.baseAccount?.pubKey?.value || [])
-            .slice(2)
-            .toString("base64"),
-        },
-      };
+        return {
+          accountNumber: Number(decodedResponse.baseAccount!.accountNumber),
+          sequence: Number(decodedResponse.baseAccount!.sequence),
+          pubkey: {
+            type: decodedResponse.baseAccount?.pubKey?.typeUrl || "",
+            value: Buffer.from(decodedResponse.baseAccount?.pubKey?.value || [])
+              .slice(2)
+              .toString("base64"),
+          },
+        };
+      }
+      return null;
+    } catch (e) {
+      this.addConnectionFailure();
+      return null;
     }
-    return null;
   }
 
   private async prepareTx(
@@ -357,115 +425,135 @@ export class CosmosClient {
     authInfoBytes: Uint8Array;
     pubkey: Any;
   }> {
-    const txBody = TxBody.fromPartial({
-      messages: msgs,
-      memo: memo || "",
-    });
+    try {
+      const txBody = TxBody.fromPartial({
+        messages: msgs,
+        memo: memo || "",
+      });
 
-    const txBodyBytes = TxBody.encode(txBody).finish();
-    const account = explicitSignerData
-      ? {
-          accountNumber: explicitSignerData.accountNumber,
-          sequence: explicitSignerData.sequence,
-        }
-      : await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
-    if (account === null) throw new Error("Account not found");
+      const txBodyBytes = TxBody.encode(txBody).finish();
+      const account = explicitSignerData
+        ? {
+            accountNumber: explicitSignerData.accountNumber,
+            sequence: explicitSignerData.sequence,
+          }
+        : await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
+      if (account === null) throw new Error("Account not found");
 
-    const { sequence, accountNumber } = account;
-    const accountFromSigner = (await (await this.getSigner()).getAccounts())![0];
-    const pubkey = encodePubkey(encodeSecp256k1Pubkey(accountFromSigner.pubkey), this.walletType === "injective");
+      const { sequence, accountNumber } = account;
+      const accountFromSigner = (await (await this.getSigner()).getAccounts())![0];
+      const pubkey = encodePubkey(encodeSecp256k1Pubkey(accountFromSigner.pubkey), this.walletType === "injective");
 
-    const finalFees = fees || (await this.simulateFees(msgs));
+      const finalFees = fees || (await this.simulateFees(msgs));
 
-    const authInfoBytes = makeAuthInfoBytes(
-      [
-        {
-          pubkey,
-          sequence,
-        },
-      ],
-      finalFees.amount,
-      new Decimal(finalFees.gas).toNumber(),
-      finalFees.granter,
-      finalFees.payer,
-    );
-    return {
-      fees: finalFees,
-      pubkey,
-      accountNumber,
-      sequence,
-      txBodyBytes,
-      authInfoBytes,
-    };
+      const authInfoBytes = makeAuthInfoBytes(
+        [
+          {
+            pubkey,
+            sequence,
+          },
+        ],
+        finalFees.amount,
+        new Decimal(finalFees.gas).toNumber(),
+        finalFees.granter,
+        finalFees.payer,
+      );
+      return {
+        fees: finalFees,
+        pubkey,
+        accountNumber,
+        sequence,
+        txBodyBytes,
+        authInfoBytes,
+      };
+    } catch (e) {
+      this.addConnectionFailure();
+      return {} as any;
+    }
   }
 
   async tx(contract: string, payload: any): Promise<string> {
     if (!this.signingClient || !this.cosmosAddress) {
       throw new Error("Signing client not initialized");
     }
-    const msgs: EncodeObject[] = [
-      {
-        typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
-        value: MsgExecuteContract.fromPartial({
-          sender: this.cosmosAddress!,
-          contract,
-          msg: Buffer.from(JSON.stringify(typeof payload === "string" ? JSON.parse(payload) : payload)),
-        }),
-      },
-    ];
+    try {
+      const msgs: EncodeObject[] = [
+        {
+          typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
+          value: MsgExecuteContract.fromPartial({
+            sender: this.cosmosAddress!,
+            contract,
+            msg: Buffer.from(JSON.stringify(typeof payload === "string" ? JSON.parse(payload) : payload)),
+          }),
+        },
+      ];
 
-    const response = await this.signAndBroadcast(msgs);
+      const response = await this.signAndBroadcast(msgs);
 
-    if (isDeliverTxFailure(response)) {
-      throw new Error(`Tx failed: ${response.rawLog}`);
+      if (isDeliverTxFailure(response)) {
+        throw new Error(`Tx failed: ${response.rawLog}`);
+      }
+
+      return response.transactionHash;
+    } catch (e) {
+      this.addConnectionFailure();
+      return "";
     }
-
-    return response.transactionHash;
   }
   async simulateFees(msgs: EncodeObject[]): Promise<StdFee> {
-    const client = new QueryClient(this.tmClient!);
-    const rpc = createProtobufRpcClient(client);
-    const queryService = new ServiceClientImpl(rpc);
-    const account = await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
-    if (account === null) throw new Error("Account not found");
+    try {
+      const client = new QueryClient(this.tmClient!);
+      const rpc = createProtobufRpcClient(client);
+      const queryService = new ServiceClientImpl(rpc);
+      const account = await this.getAccount(this.cosmosAddress!, this.walletType === "injective");
+      if (account === null) throw new Error("Account not found");
 
-    const { sequence } = account;
-    const accountFromSigner = (await (await this.getSigner()).getAccounts())![0];
-    const pubkey = encodePubkey(encodeSecp256k1Pubkey(accountFromSigner.pubkey), this.walletType === "injective");
+      const { sequence } = account;
+      const accountFromSigner = (await (await this.getSigner()).getAccounts())![0];
+      const pubkey = encodePubkey(encodeSecp256k1Pubkey(accountFromSigner.pubkey), this.walletType === "injective");
 
-    const tx = Tx.fromPartial({
-      authInfo: AuthInfo.fromPartial({
-        fee: Fee.fromPartial({}),
-        signerInfos: [
+      const tx = Tx.fromPartial({
+        authInfo: AuthInfo.fromPartial({
+          fee: Fee.fromPartial({}),
+          signerInfos: [
+            {
+              publicKey: pubkey,
+              sequence: Long.fromNumber(sequence, true),
+              modeInfo: { single: { mode: SignMode.SIGN_MODE_UNSPECIFIED } },
+            },
+          ],
+        }),
+        body: TxBody.fromPartial({
+          messages: Array.from(msgs),
+          memo: "",
+        }),
+        signatures: [new Uint8Array()],
+      });
+      const request = SimulateRequest.fromPartial({
+        txBytes: Tx.encode(tx).finish(),
+      });
+      const response = await queryService.Simulate(request);
+
+      const gas = new Decimal(response.gasInfo!.gasUsed.toString());
+
+      return {
+        amount: [
           {
-            publicKey: pubkey,
-            sequence: Long.fromNumber(sequence, true),
-            modeInfo: { single: { mode: SignMode.SIGN_MODE_UNSPECIFIED } },
+            denom: this.gasDenom,
+            amount: gas
+              .mul(new Decimal(this.gasAdjustment!))
+              .round()
+              .mul(new Decimal(this.gasPrice!))
+              .ceil()
+              .toFixed(0),
           },
         ],
-      }),
-      body: TxBody.fromPartial({
-        messages: Array.from(msgs),
-        memo: "",
-      }),
-      signatures: [new Uint8Array()],
-    });
-    const request = SimulateRequest.fromPartial({
-      txBytes: Tx.encode(tx).finish(),
-    });
-    const response = await queryService.Simulate(request);
-
-    const gas = new Decimal(response.gasInfo!.gasUsed.toString());
-
-    return {
-      amount: [
-        {
-          denom: this.gasDenom,
-          amount: gas.mul(new Decimal(this.gasAdjustment!)).round().mul(new Decimal(this.gasPrice!)).ceil().toFixed(0),
-        },
-      ],
-      gas: gas.mul(new Decimal(this.gasAdjustment!)).round().toFixed(0),
-      granter: this.granter,
-    } as StdFee;
+        gas: gas.mul(new Decimal(this.gasAdjustment!)).round().toFixed(0),
+        granter: this.granter,
+      } as StdFee;
+    } catch (e) {
+      this.addConnectionFailure();
+      return {} as any;
+    }
   }
 }
