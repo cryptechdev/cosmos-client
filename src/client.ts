@@ -47,7 +47,7 @@ import { Any } from "cosmjs-types/google/protobuf/any";
 import Decimal from "decimal.js";
 import Long from "long";
 import { createDefaultTypes, encodePubkey } from "./utils";
-import { wait } from "ts-retry";
+import { wait, waitUntilAsync } from "ts-retry";
 
 export type CosmosClientOptions = {
   chainId: string;
@@ -242,14 +242,18 @@ export class CosmosClient {
 
   private async setClients(endpoint: string) {
     try {
-      this.tmClient = await Tendermint37Client.connect(endpoint);
-      this.querier = await CosmWasmClient.create(this.tmClient);
+      await waitUntilAsync(async () => {
+        this.tmClient = await Tendermint37Client.connect(endpoint);
+        this.querier = await CosmWasmClient.create(this.tmClient);
+        this.connectionErrors = 0;
+      }, 5000);
     } catch (e) {
-      this.addConnectionFailure();
+      await this.addConnectionFailure();
     }
   }
 
   private async addConnectionFailure() {
+    console.log("connection failure");
     this.connectionErrors++;
     if (this.connectionErrors > this.rpcEndpoints.length) {
       await wait(this.connectionTimeout);
