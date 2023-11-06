@@ -1,10 +1,4 @@
-import {
-  OfflineAminoSigner,
-  Pubkey,
-  SinglePubkey,
-  encodeSecp256k1Pubkey,
-  makeSignDoc as makeSignDocAmino,
-} from "@cosmjs/amino";
+import { OfflineAminoSigner, Pubkey, encodeSecp256k1Pubkey, makeSignDoc as makeSignDocAmino } from "@cosmjs/amino";
 import { CosmWasmClient, SigningCosmWasmClient, createWasmAminoConverters } from "@cosmjs/cosmwasm-stargate";
 import { HdPath, Slip10RawIndex } from "@cosmjs/crypto";
 import { fromBase64 } from "@cosmjs/encoding";
@@ -30,13 +24,7 @@ import {
 } from "@cosmjs/stargate";
 import { Tendermint37Client } from "@cosmjs/tendermint-rpc";
 import { InjectiveTypesV1Beta1Account } from "@injectivelabs/core-proto-ts";
-import {
-  BaseAccount,
-  ChainRestAuthApi,
-  InjectiveDirectEthSecp256k1Wallet,
-  PrivateKey,
-  getPublicKey,
-} from "@injectivelabs/sdk-ts";
+import { InjectiveDirectEthSecp256k1Wallet, PrivateKey } from "@injectivelabs/sdk-ts";
 import { chains } from "chain-registry";
 import { QueryAccountRequest, QueryClientImpl } from "cosmjs-types/cosmos/auth/v1beta1/query";
 import { SignMode } from "cosmjs-types/cosmos/tx/signing/v1beta1/signing";
@@ -46,8 +34,8 @@ import { MsgExecuteContract } from "cosmjs-types/cosmwasm/wasm/v1/tx";
 import { Any } from "cosmjs-types/google/protobuf/any";
 import Decimal from "decimal.js";
 import Long from "long";
-import { createDefaultTypes, encodePubkey } from "./utils";
 import { wait, waitUntilAsync } from "ts-retry";
+import { createDefaultTypes, encodePubkey } from "./utils";
 
 export type CosmosClientOptions = {
   chainId: string;
@@ -102,6 +90,7 @@ export class CosmosClient {
   tmClient?: Tendermint37Client;
   connectionErrors: number = 0;
   connectionTimeout: number = 30000;
+  rotatingEndpoint: boolean = false;
   private getPrivateKey(): PrivateKey {
     return PrivateKey.fromMnemonic(this.mnemonic, `m/44'/${this.coinType}'/0'/0/0`);
   }
@@ -253,6 +242,8 @@ export class CosmosClient {
   }
 
   private async addConnectionFailure() {
+    if (this.rotatingEndpoint) return;
+    this.rotatingEndpoint = true;
     console.log("connection failure");
     this.connectionErrors++;
     if (this.connectionErrors > this.rpcEndpoints.length) {
@@ -262,6 +253,7 @@ export class CosmosClient {
     this.rotateEndpoint();
     await wait(3000);
     await this.setClients(this.rpcEndpoint);
+    this.rotatingEndpoint = false;
   }
 
   private rotateEndpoint() {
