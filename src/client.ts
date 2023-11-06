@@ -244,7 +244,6 @@ export class CosmosClient {
   private async addConnectionFailure() {
     if (this.rotatingEndpoint) return;
     this.rotatingEndpoint = true;
-    console.log("connection failure");
     this.connectionErrors++;
     if (this.connectionErrors > this.rpcEndpoints.length) {
       await wait(this.connectionTimeout);
